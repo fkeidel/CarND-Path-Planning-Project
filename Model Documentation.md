@@ -23,4 +23,4 @@ The knots get transformed to the local car coordinate system (395-403). The spli
 # Result
 The path planner was able to drive the car without incident for more than a 4.32 miles. The following image is showing the car after 10 miles.
 
-![10 miles driven]('https://github.com/fkeidel/CarND-Path-Planning-Project/tree/master/img/10 miles driven.PNG' "10 miles driven.PNG")
+![10 miles driven](https://github.com/fkeidel/CarND-Path-Planning-Project/blob/master/img/10%20miles%20driven.PNG "10 miles driven.PNG")
