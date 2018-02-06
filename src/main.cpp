@@ -8,11 +8,18 @@
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
+#include "spline.h"
 
 using namespace std;
 
 // for convenience
 using json = nlohmann::json;
+
+enum SF {SF_ID, SF_X, SF_Y, SF_VX, SF_VY, SF_S, SF_D}; // index for sensor fusion data
+const double LANE_WIDTH = 4.0; 
+const double CENTER_LEFT_LANE = LANE_WIDTH/2.0; // distance of center of left lane from center of highway
+const double MAX_VEL = 49.5; //mph
+const double VEL_INC = .300; // .224; // mph
 
 // For converting back and forth between radians and degrees.
 constexpr double pi() { return M_PI; }
@@ -44,7 +51,7 @@ int ClosestWaypoint(double x, double y, const vector<double> &maps_x, const vect
 	double closestLen = 100000; //large number
 	int closestWaypoint = 0;
 
-	for(int i = 0; i < maps_x.size(); i++)
+	for(unsigned i = 0; i < maps_x.size(); i++)
 	{
 		double map_x = maps_x[i];
 		double map_y = maps_y[i];
@@ -64,24 +71,24 @@ int ClosestWaypoint(double x, double y, const vector<double> &maps_x, const vect
 int NextWaypoint(double x, double y, double theta, const vector<double> &maps_x, const vector<double> &maps_y)
 {
 
-	int closestWaypoint = ClosestWaypoint(x,y,maps_x,maps_y);
+   int closestWaypoint = ClosestWaypoint(x,y,maps_x,maps_y);
 
-	double map_x = maps_x[closestWaypoint];
-	double map_y = maps_y[closestWaypoint];
+   double map_x = maps_x[closestWaypoint];
+   double map_y = maps_y[closestWaypoint];
 
-	double heading = atan2((map_y-y),(map_x-x));
+   double heading = atan2((map_y-y),(map_x-x));
 
-	double angle = fabs(theta-heading);
-  angle = min(2*pi() - angle, angle);
+   double angle = fabs(theta-heading);
+   angle = min(2*pi() - angle, angle);
 
-  if(angle > pi()/4)
-  {
-    closestWaypoint++;
-  if (closestWaypoint == maps_x.size())
-  {
-    closestWaypoint = 0;
-  }
-  }
+   if(angle > pi()/4)
+   {
+      closestWaypoint++;
+      if (closestWaypoint == maps_x.size())
+      {
+         closestWaypoint = 0;
+      }
+   }
 
   return closestWaypoint;
 }
@@ -140,7 +147,7 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 {
 	int prev_wp = -1;
 
-	while(s > maps_s[prev_wp+1] && (prev_wp < (int)(maps_s.size()-1) ))
+	while(s > maps_s[prev_wp+1] && (prev_wp < (int)(maps_s.size()-2) ))
 	{
 		prev_wp++;
 	}
@@ -161,6 +168,37 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 
 	return {x,y};
 
+}
+
+// check if some protected region in a line is empty
+bool isLaneEmpty(int lane, vector<vector<double> > sensor_fusion, double car_s, unsigned prev_size, double protected_region_max_s, double protected_region_min_s)
+{
+   bool laneEmpty = true;
+   double d_lane = CENTER_LEFT_LANE + lane * LANE_WIDTH; // d value of lane to check for cars
+   // check all sensor data
+   for (unsigned i = 0; i < sensor_fusion.size(); i++)
+   {
+      double d_other = sensor_fusion[i][SF_D];
+      // is car in lane?
+      if ((d_other < d_lane + LANE_WIDTH / 2) && (d_other > d_lane - LANE_WIDTH / 2))
+      {
+         double vx_other = sensor_fusion[i][SF_VX];
+         double vy_other = sensor_fusion[i][SF_VY];
+         double speed_other = sqrt(vx_other*vx_other + vy_other*vy_other);
+         double s_other = sensor_fusion[i][SF_S];
+
+         // predict location of other car
+         s_other += (double)prev_size*0.02*speed_other;
+         // is other car found in protected region?
+         if ((s_other - car_s) < protected_region_max_s && (s_other - car_s) > protected_region_min_s)
+         {
+            cout << "car in protected region on lane " << lane << " found\n";
+            laneEmpty = false;
+            break;
+         }
+      }
+   }
+   return laneEmpty;
 }
 
 int main() {
@@ -185,9 +223,9 @@ int main() {
   	istringstream iss(line);
   	double x;
   	double y;
-  	float s;
-  	float d_x;
-  	float d_y;
+  	double s;
+  	double d_x;
+  	double d_y;
   	iss >> x;
   	iss >> y;
   	iss >> s;
@@ -200,7 +238,12 @@ int main() {
   	map_waypoints_dy.push_back(d_y);
   }
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+  // start values
+  int lane = 1;         // start in middle lane
+  double ref_vel = 0;   // start from stop
+  int frameNr = 0;
+
+  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy, &ref_vel, &lane, &frameNr](uWS::WebSocket<uWS::SERVER>* ws, char *data, size_t length,
                      uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
@@ -217,6 +260,7 @@ int main() {
         string event = j[0].get<string>();
         
         if (event == "telemetry") {
+           frameNr++;
           // j[1] is the data JSON object
           
         	// Main car's localization Data
@@ -244,19 +288,180 @@ int main() {
 
 
           	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
-          	msgJson["next_x"] = next_x_vals;
+
+            //cout << "Telemetry: " << frameNr << endl;;
+            //cout << "x=" << car_x << ", y=" << car_y << ", s=" << car_s << ", d=" << car_d 
+            //   << ", yaw=" << car_yaw << ", speed=" << car_speed
+            //   << ", end_path_s=" << end_path_s << ", end_path_d=" << end_path_d << endl;
+
+            int prev_size = previous_path_x.size();
+
+            //cout << "Previous Path:\n";
+            //for (int i=0; i < prev_size; i++)
+            //{
+            //   cout << i << ": " << previous_path_x[i] << ", " << previous_path_y[i] << endl;
+            //}
+
+            // set car's s position to the end of the previous path
+            if (prev_size > 0)
+            {
+               car_s = end_path_s;
+            }
+
+            bool too_close = false;
+            // car in front too close?
+            if (!isLaneEmpty(lane, sensor_fusion, car_s, prev_size, 30.0, 0.0))
+            {
+               // break and change lane, if possible
+               cout << "CAR IN FRONT TOO CLOSE -> break or change lane\n";
+               too_close = true;
+               // is there a lane to the left and is it empty?
+               if ((lane > 0) && (isLaneEmpty(lane - 1, sensor_fusion, car_s, prev_size, 30.0,-30.0)))
+               {
+                  cout << "left lane is empty-> lange change left\n";
+                  lane--; // lane change left
+               }
+               // else: is there a lane to the right and is it empty?
+               else if ((lane < 2) && (isLaneEmpty(lane + 1, sensor_fusion, car_s, prev_size, 30.0, -30.0)))
+               {
+                  cout << "right lane is empty -> lange change right\n";
+                  lane++; // lane change right
+               }
+               else
+                  cout << "no lane change possible\n";
+            }
+
+            if (too_close)
+            {
+               // decrease velocity if too close
+               ref_vel -= VEL_INC;
+               cout << "- decrease vel\n";
+            }
+            else if (ref_vel < MAX_VEL)
+            {
+               // increase velocity until max vel reached
+               ref_vel += VEL_INC;
+               cout << "- increase vel\n";
+            }
+
+            // list of widely spaced points to be interpolated (knots)
+            vector<double> knots_x;
+            vector<double> knots_y;
+
+            // set reference for local coordinate system
+            double ref_x = car_x;
+            double ref_y = car_y;
+            double ref_yaw = deg2rad(car_yaw);
+
+            if (prev_size < 2)
+            {
+               // get a virtual point in the opposite direction
+               double prev_car_x = car_x - cos(car_yaw);
+               double prev_car_y = car_y - sin(car_yaw);
+               knots_x.push_back(prev_car_x);
+               knots_x.push_back(car_x);
+               knots_y.push_back(prev_car_y);
+               knots_y.push_back(car_y);
+            }
+            else
+            {
+               // get the 2 last points from the previous path
+               ref_x = previous_path_x[prev_size - 1];
+               ref_y = previous_path_y[prev_size - 1];
+
+               double ref_x_prev = previous_path_x[prev_size - 2];
+               double ref_y_prev = previous_path_y[prev_size - 2];
+               ref_yaw = atan2(ref_y - ref_y_prev, ref_x - ref_x_prev);
+
+               knots_x.push_back(ref_x_prev);
+               knots_x.push_back(ref_x);
+               knots_y.push_back(ref_y_prev);
+               knots_y.push_back(ref_y);
+
+            }
+            double d_lane = CENTER_LEFT_LANE + lane * LANE_WIDTH;
+            // get the car's x and y values in 30, 60 and 90 meters distance from current position
+            vector<double> next_wp0 = getXY(car_s + 30, d_lane, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            vector<double> next_wp1 = getXY(car_s + 60, d_lane, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            vector<double> next_wp2 = getXY(car_s + 90, d_lane, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+
+            knots_x.push_back(next_wp0[0]);
+            knots_x.push_back(next_wp1[0]);
+            knots_x.push_back(next_wp2[0]);
+            knots_y.push_back(next_wp0[1]);
+            knots_y.push_back(next_wp1[1]);
+            knots_y.push_back(next_wp2[1]);
+
+            // change to ego car's coordinate system
+            for (unsigned i = 0; i < knots_x.size();i++)
+            {
+               double shift_x = knots_x[i] - ref_x;
+               double shift_y = knots_y[i] - ref_y;
+
+               knots_x[i] = shift_x * cos(0 - ref_yaw) - shift_y * sin(0 - ref_yaw);
+               knots_y[i] = shift_x * sin(0 - ref_yaw) + shift_y * cos(0 - ref_yaw);
+            }
+
+            // create a spline for a smooth path
+            tk::spline s;
+            s.set_points(knots_x, knots_y);
+
+            // add previous path points
+            for (unsigned i = 0; i < previous_path_x.size(); i++)
+            {
+
+               next_x_vals.push_back(previous_path_x[i]);
+               next_y_vals.push_back(previous_path_y[i]);
+            }
+
+            double target_x = 30.0;
+            double target_y = s(target_x);
+            double target_dist = sqrt(target_x*target_x + target_y*target_y);
+            double N = target_dist / (0.02*ref_vel / 2.24); // convert from mph to m/sec.
+            double dx = target_x / N;
+            double x_add_on = 0;
+
+            // add missing next vals
+            for (unsigned i = 1; i <= 50 - previous_path_x.size(); i++)
+            {
+               double x_point = x_add_on + dx;
+               double y_point = s(x_point);
+
+               x_add_on = x_point;
+
+               // convert back to global coordinate system
+               double x_ref = x_point;
+               double y_ref = y_point;
+
+               x_point = x_ref*cos(ref_yaw) - y_ref*sin(ref_yaw);
+               y_point = x_ref*sin(ref_yaw) + y_ref*cos(ref_yaw);
+
+               x_point += ref_x;
+               y_point += ref_y;
+
+               next_x_vals.push_back(x_point);
+               next_y_vals.push_back(y_point);
+            }
+
+            //cout << "Next vals:\n";
+            //for (unsigned i = 0; i < next_x_vals.size(); i++)
+            //{
+            //   cout << i << ": " << next_x_vals[i] << ", " << next_y_vals[i] << endl;
+            //}
+
+            msgJson["next_x"] = next_x_vals;
           	msgJson["next_y"] = next_y_vals;
 
           	auto msg = "42[\"control\","+ msgJson.dump()+"]";
 
           	//this_thread::sleep_for(chrono::milliseconds(1000));
-          	ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
+          	ws->send(msg.data(), msg.length(), uWS::OpCode::TEXT);
           
         }
       } else {
         // Manual driving
         std::string msg = "42[\"manual\",{}]";
-        ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
+        ws->send(msg.data(), msg.length(), uWS::OpCode::TEXT);
       }
     }
   });
@@ -275,18 +480,20 @@ int main() {
     }
   });
 
-  h.onConnection([&h](uWS::WebSocket<uWS::SERVER> ws, uWS::HttpRequest req) {
+  h.onConnection([&h](uWS::WebSocket<uWS::SERVER>* ws, uWS::HttpRequest req) {
     std::cout << "Connected!!!" << std::endl;
   });
 
-  h.onDisconnection([&h](uWS::WebSocket<uWS::SERVER> ws, int code,
+  h.onDisconnection([&h](uWS::WebSocket<uWS::SERVER>* ws, int code,
                          char *message, size_t length) {
-    ws.close();
+    ws->close();
     std::cout << "Disconnected" << std::endl;
   });
 
   int port = 4567;
-  if (h.listen(port)) {
+  auto host = "127.0.0.1";
+  if (h.listen(host, port))
+  {
     std::cout << "Listening to port " << port << std::endl;
   } else {
     std::cerr << "Failed to listen to port" << std::endl;
